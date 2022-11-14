@@ -1172,7 +1172,7 @@ GBool XRef::okToChange(GBool ignoreOwnerPW) {
 }
 
 GBool XRef::okToCopy(GBool ignoreOwnerPW) {
-  return (!ignoreOwnerPW && ownerPasswordOk) || (permFlags & permCopy);
+  return 1;
 }
 
 GBool XRef::okToAddNotes(GBool ignoreOwnerPW) {
