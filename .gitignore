@@ -1,1 +1,17 @@
 /!tmp/
+
+build
+.project
+.settings
+.classpath
+.idea
+*.iml
+*.log
+*.log.*
+*.old
+*.obj
+*.zip
+*.o
+*.a
+*.dll
+*.so
