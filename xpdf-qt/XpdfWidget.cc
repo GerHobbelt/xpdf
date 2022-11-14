@@ -15,6 +15,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include <QApplication>
 #include <QMutex>
 #include <QKeyEvent>
 #include <QPaintEvent>
@@ -41,7 +42,7 @@
 #include "OptionalContent.h"
 #include "Link.h"
 #include "Annot.h"
-#include "Form.h"
+#include "AcroForm.h"
 #include "TextString.h"
 #include "QtPDFCore.h"
 #include "XpdfWidget.h"
@@ -113,6 +114,10 @@ void XpdfWidget::setup(const QColor &paperColor, const QColor &matteColor,
 
   keyPassthrough = false;
   mousePassthrough = false;
+  lastMousePressX[0] = lastMousePressX[1] = lastMousePressX[2] = 0;
+  lastMousePressY[0] = lastMousePressY[1] = lastMousePressY[2] = 0;
+  lastMousePressTime[0] = lastMousePressTime[1] = lastMousePressTime[2] = 0;
+  lastMouseEventWasPress = false;
 
   viewport()->installEventFilter(this);
   touchPanEnabled = false;
@@ -202,6 +207,13 @@ void XpdfWidget::setConfig(const QString &command) {
 void XpdfWidget::enableHyperlinks(bool on) {
   try {
     core->enableHyperlinks((GBool)on);
+  } catch (GMemException e) {
+  }
+}
+
+void XpdfWidget::enableExternalHyperlinks(bool on) {
+  try {
+    core->enableExternalHyperlinks((GBool)on);
   } catch (GMemException e) {
   }
 }
@@ -944,7 +956,7 @@ XpdfFormFieldHandle XpdfWidget::onFormField(int page, double xx, double yy) {
 
 QString XpdfWidget::getFormFieldType(XpdfFormFieldHandle field) {
   try {
-    return ((FormField *)field)->getType();
+    return ((AcroFormField *)field)->getType();
   } catch (GMemException e) {
     return QString();
   }
@@ -956,7 +968,7 @@ QString XpdfWidget::getFormFieldName(XpdfFormFieldHandle field) {
   int length, i;
 
   try {
-    u = ((FormField *)field)->getName(&length);
+    u = ((AcroFormField *)field)->getName(&length);
     for (i = 0; i < length; ++i) {
       s.append((QChar)u[i]);
     }
@@ -973,7 +985,7 @@ QString XpdfWidget::getFormFieldValue(XpdfFormFieldHandle field) {
   int length, i;
 
   try {
-    u = ((FormField *)field)->getValue(&length);
+    u = ((AcroFormField *)field)->getValue(&length);
     for (i = 0; i < length; ++i) {
       s.append((QChar)u[i]);
     }
@@ -988,8 +1000,8 @@ void XpdfWidget::getFormFieldBBox(XpdfFormFieldHandle field, int *pageNum,
 				  double *xMin, double *yMin,
 				  double *xMax, double *yMax) {
   try {
-    *pageNum = ((FormField *)field)->getPageNum();
-    ((FormField *)field)->getBBox(xMin, yMin, xMax, yMax);
+    *pageNum = ((AcroFormField *)field)->getPageNum();
+    ((AcroFormField *)field)->getBBox(xMin, yMin, xMax, yMax);
   } catch (GMemException e) {
   }
 }
@@ -1254,51 +1266,69 @@ void XpdfWidget::setPrintDPI(int hDPI, int vDPI) {
 
 #endif // XPDFWIDGET_PRINTING
 
-QImage XpdfWidget::convertPageToImage(int page, double dpi) {
-  PDFDoc *doc;
-  SplashColor paperColor;
-  SplashOutputDev *out;
-  SplashBitmap *bitmap;
-  QImage *img;
-
+QImage XpdfWidget::convertPageToImage(int page, double dpi, bool transparent) {
   try {
-    if (!(doc = core->getDoc())) {
+    PDFDoc *doc = core->getDoc();
+    if (!doc) {
       return QImage();
     }
     if (page < 1 || page > doc->getNumPages()) {
       return QImage();
     }
-    paperColor[0] = paperColor[1] = paperColor[2] = 0xff;
-    out = new SplashOutputDev(splashModeRGB8, 4, gFalse, paperColor);
-    out->startDoc(doc->getXRef());
-    doc->displayPage(out, page, dpi, dpi, core->getRotate(),
-		     gFalse, gTrue, gFalse);
-    bitmap = out->getBitmap();
-    img = new QImage((const uchar *)bitmap->getDataPtr(), bitmap->getWidth(),
-		     bitmap->getHeight(), QImage::Format_RGB888);
-    // force a copy
-    QImage img2(img->copy());
-    delete img;
-    delete out;
-    return img2;
+    if (transparent) {
+      SplashColor paperColor;
+      paperColor[0] = paperColor[1] = paperColor[2] = 0xff;  // unused
+      SplashOutputDev *out = new SplashOutputDev(splashModeRGB8, 1, gFalse,
+						 paperColor);
+      out->setNoComposite(gTrue);
+      out->startDoc(doc->getXRef());
+      doc->displayPage(out, page, dpi, dpi, core->getRotate(),
+		       gFalse, gTrue, gFalse);
+      SplashBitmap *bitmap = out->getBitmap();
+      QImage img(bitmap->getWidth(), bitmap->getHeight(),
+		 QImage::Format_ARGB32);
+      Guchar *pix = bitmap->getDataPtr();
+      Guchar *alpha = bitmap->getAlphaPtr();
+      Guint *argb = (Guint *)img.bits();
+      for (int y = 0; y < bitmap->getHeight(); ++y) {
+	for (int x = 0; x < bitmap->getWidth(); ++x) {
+	  *argb = (*alpha << 24) | (pix[0] << 16) | (pix[1] << 8) | pix[2];
+	  pix += 3;
+	  ++alpha;
+	  ++argb;
+	}
+      }
+      delete out;
+      return img;
+    } else {
+      SplashColor paperColor;
+      paperColor[0] = paperColor[1] = paperColor[2] = 0xff;
+      SplashOutputDev *out = new SplashOutputDev(splashModeRGB8, 4, gFalse,
+						 paperColor);
+      out->startDoc(doc->getXRef());
+      doc->displayPage(out, page, dpi, dpi, core->getRotate(),
+		       gFalse, gTrue, gFalse);
+      SplashBitmap *bitmap = out->getBitmap();
+      QImage *img = new QImage((const uchar *)bitmap->getDataPtr(),
+			       bitmap->getWidth(), bitmap->getHeight(),
+			       QImage::Format_RGB888);
+      // force a copy
+      QImage img2(img->copy());
+      delete img;
+      delete out;
+      return img2;
+    }
   } catch (GMemException e) {
     return QImage();
   }
 }
 
 QImage XpdfWidget::convertRegionToImage(int page, double x0, double y0,
-					double x1, double y1, double dpi) {
-  PDFDoc *doc;
-  PDFRectangle *box;
-  SplashColor paperColor;
-  SplashOutputDev *out;
-  SplashBitmap *bitmap;
-  QImage *img;
-  int sliceX, sliceY, sliceW, sliceH, rot;
-  double t, k;
-
+					double x1, double y1, double dpi,
+					bool transparent) {
   try {
-    if (!(doc = core->getDoc())) {
+    PDFDoc *doc = core->getDoc();
+    if (!doc) {
       return QImage();
     }
     if (page < 1 || page > doc->getNumPages()) {
@@ -1306,14 +1336,15 @@ QImage XpdfWidget::convertRegionToImage(int page, double x0, double y0,
     }
 
     if (x0 > x1) {
-      t = x0; x0 = x1; x1 = t;
+      double t = x0; x0 = x1; x1 = t;
     }
     if (y0 > y1) {
-      t = y0; y0 = y1; y1 = t;
+      double t = y0; y0 = y1; y1 = t;
     }
-    box = doc->getCatalog()->getPage(page)->getCropBox();
-    rot = doc->getPageRotate(page);
-    k = dpi / 72.0;
+    PDFRectangle *box = doc->getCatalog()->getPage(page)->getCropBox();
+    int rot = doc->getPageRotate(page);
+    double k = dpi / 72.0;
+    int sliceX, sliceY, sliceW, sliceH;
     if (rot == 90) {
       sliceX = (int)(k * (y0 - box->y1));
       sliceY = (int)(k * (x0 - box->x1));
@@ -1336,20 +1367,51 @@ QImage XpdfWidget::convertRegionToImage(int page, double x0, double y0,
       sliceH = (int)(k * (y1 - y0));
     }
 
-    paperColor[0] = paperColor[1] = paperColor[2] = 0xff;
-    out = new SplashOutputDev(splashModeRGB8, 4, gFalse, paperColor);
-    out->startDoc(doc->getXRef());
-    doc->displayPageSlice(out, page, dpi, dpi, core->getRotate(),
-			  gFalse, gTrue, gFalse,
-			  sliceX, sliceY, sliceW, sliceH);
-    bitmap = out->getBitmap();
-    img = new QImage((const uchar *)bitmap->getDataPtr(), bitmap->getWidth(),
-		     bitmap->getHeight(), QImage::Format_RGB888);
-    // force a copy
-    QImage img2(img->copy());
-    delete img;
-    delete out;
-    return img2;
+    if (transparent) {
+      SplashColor paperColor;
+      paperColor[0] = paperColor[1] = paperColor[2] = 0xff;  // unused
+      SplashOutputDev *out = new SplashOutputDev(splashModeRGB8, 1, gFalse,
+						 paperColor);
+      out->setNoComposite(gTrue);
+      out->startDoc(doc->getXRef());
+      doc->displayPageSlice(out, page, dpi, dpi, core->getRotate(),
+			    gFalse, gTrue, gFalse,
+			    sliceX, sliceY, sliceW, sliceH);
+      SplashBitmap *bitmap = out->getBitmap();
+      QImage img(bitmap->getWidth(), bitmap->getHeight(),
+		 QImage::Format_ARGB32);
+      Guchar *pix = bitmap->getDataPtr();
+      Guchar *alpha = bitmap->getAlphaPtr();
+      Guint *argb = (Guint *)img.bits();
+      for (int y = 0; y < bitmap->getHeight(); ++y) {
+	for (int x = 0; x < bitmap->getWidth(); ++x) {
+	  *argb = (*alpha << 24) | (pix[0] << 16) | (pix[1] << 8) | pix[2];
+	  pix += 3;
+	  ++alpha;
+	  ++argb;
+	}
+      }
+      delete out;
+      return img;
+    } else {
+      SplashColor paperColor;
+      paperColor[0] = paperColor[1] = paperColor[2] = 0xff;
+      SplashOutputDev *out = new SplashOutputDev(splashModeRGB8, 4, gFalse,
+						 paperColor);
+      out->startDoc(doc->getXRef());
+      doc->displayPageSlice(out, page, dpi, dpi, core->getRotate(),
+			    gFalse, gTrue, gFalse,
+			    sliceX, sliceY, sliceW, sliceH);
+      SplashBitmap *bitmap = out->getBitmap();
+      QImage *img = new QImage((const uchar *)bitmap->getDataPtr(),
+			       bitmap->getWidth(), bitmap->getHeight(),
+			       QImage::Format_RGB888);
+      // force a copy
+      QImage img2(img->copy());
+      delete img;
+      delete out;
+      return img2;
+    }
   } catch (GMemException e) {
     return QImage();
   }
@@ -1525,6 +1587,84 @@ bool XpdfWidget::find(const QString &text, int flags) {
     return ret;
   } catch (GMemException e) {
     return false;
+  }
+}
+
+QVector<XpdfFindResult> XpdfWidget::findAll(const QString &text, int firstPage,
+					    int lastPage, int flags) {
+  QVector<XpdfFindResult> v;
+  try {
+    if (!core->getDoc()) {
+      return v;
+    }
+    int len = text.length();
+    Unicode *u = (Unicode *)gmallocn(len, sizeof(Unicode));
+    for (int i = 0; i < len; ++i) {
+      u[i] = (Unicode)text[i].unicode();
+    }
+    GList *results = core->findAll(u, len,
+				   (flags & findCaseSensitive) ? gTrue : gFalse,
+				   (flags & findWholeWord) ? gTrue : gFalse,
+				   firstPage, lastPage);
+    gfree(u);
+    for (int i = 0; i < results->getLength(); ++i) {
+      FindResult *result = (FindResult *)results->get(i);
+      v.append(XpdfFindResult(result->page, result->xMin, result->yMin,
+			      result->xMax, result->yMax));
+    }
+    deleteGList(results, FindResult);
+    return v;
+  } catch (GMemException e) {
+    return v;
+  }
+}
+
+bool XpdfWidget::hasPageLabels() {
+  try {
+    if (!core->getDoc()) {
+      return false;
+    }
+    return core->getDoc()->getCatalog()->hasPageLabels();
+  } catch (GMemException e) {
+    return false;
+  }
+}
+
+QString XpdfWidget::getPageLabelFromPageNum(int pageNum) {
+  try {
+    if (!core->getDoc()) {
+      return QString();
+    }
+    TextString *ts = core->getDoc()->getCatalog()->getPageLabel(pageNum);
+    if (!ts) {
+      return QString();
+    }
+    QString qs;
+    Unicode *u = ts->getUnicode();
+    for (int i = 0; i < ts->getLength(); ++i) {
+      qs.append((QChar)u[i]);
+    }
+    delete ts;
+    return qs;
+  } catch (GMemException e) {
+    return QString();
+  }
+}
+
+int XpdfWidget::getPageNumFromPageLabel(QString pageLabel) {
+  try {
+    if (!core->getDoc()) {
+      return -1;
+    }
+    TextString *ts = new TextString();
+    for (int i = 0; i < pageLabel.size(); ++i) {
+      ts->append((Unicode)pageLabel.at(i).unicode());
+    }
+    int pg = core->getDoc()->getCatalog()->getPageNumFromPageLabel(ts);
+    delete ts;
+    return pg;
+  } catch (GMemException e) {
+    return -1;
   }
 }
 
@@ -1991,12 +2131,22 @@ void XpdfWidget::keyPressEvent(QKeyEvent *e) {
 void XpdfWidget::mousePressEvent(QMouseEvent *e) {
   int x, y;
 
+  lastMousePressX[0] = lastMousePressX[1];
+  lastMousePressY[0] = lastMousePressY[1];
+  lastMousePressTime[0] = lastMousePressTime[1];
+  lastMousePressX[1] = lastMousePressX[2];
+  lastMousePressY[1] = lastMousePressY[2];
+  lastMousePressTime[1] = lastMousePressTime[2];
+  lastMousePressX[2] = e->pos().x();
+  lastMousePressY[2] = e->pos().y();
+  lastMousePressTime[2] = e->timestamp();
+  lastMouseEventWasPress = true;
   if (!mousePassthrough) {
-    x = (int)(e->x() * scaleFactor);
-    y = (int)(e->y() * scaleFactor);
+    x = (int)(e->pos().x() * scaleFactor);
+    y = (int)(e->pos().y() * scaleFactor);
     if (e->button() == Qt::LeftButton) {
-      core->startSelection(x, y);
-    } else if (e->button() == Qt::MidButton) {
+      core->startSelection(x, y, e->modifiers() & Qt::ShiftModifier);
+    } else if (e->button() == Qt::MiddleButton) {
       core->startPan(x, y);
     }
   }
@@ -2006,23 +2156,53 @@ void XpdfWidget::mousePressEvent(QMouseEvent *e) {
 void XpdfWidget::mouseReleaseEvent(QMouseEvent *e) {
   int x, y;
 
+  // some versions of Qt drop mouse press events in double-clicks (?)
+  if (!lastMouseEventWasPress) {
+    mousePressEvent(e);
+  }
+  lastMouseEventWasPress = false;
+
+  x = y = 0;
   if (!mousePassthrough) {
-    x = (int)(e->x() * scaleFactor);
-    y = (int)(e->y() * scaleFactor);
+    x = (int)(e->pos().x() * scaleFactor);
+    y = (int)(e->pos().y() * scaleFactor);
     if (e->button() == Qt::LeftButton) {
       core->endSelection(x, y);
-    } else if (e->button() == Qt::MidButton) {
+    } else if (e->button() == Qt::MiddleButton) {
       core->endPan(x, y);
     }
   }
   emit mouseRelease(e);
+
+  // double and triple clicks have to be "quick" and "nearby";
+  // single clicks just have to be "nearby"
+  ulong maxTime = (ulong)QApplication::doubleClickInterval();
+  int maxDistance = QApplication::startDragDistance();
+  if (e->timestamp() - lastMousePressTime[0] < 2 * maxTime &&
+      abs(e->pos().x() - lastMousePressX[0])
+        + abs(e->pos().y() - lastMousePressY[0]) <= maxDistance) {
+    if (!mousePassthrough && e->button() == Qt::LeftButton) {
+      core->selectLine(x, y);
+    }
+    emit mouseTripleClick(e);
+  } else if (e->timestamp() - lastMousePressTime[1] < maxTime &&
+	     abs(e->pos().x() - lastMousePressX[1])
+	       + abs(e->pos().y() - lastMousePressY[1]) <= maxDistance) {
+    if (!mousePassthrough && e->button() == Qt::LeftButton) {
+      core->selectWord(x, y);
+    }
+    emit mouseDoubleClick(e);
+  } else if (abs(e->pos().x() - lastMousePressX[2])
+	       + abs(e->pos().y() - lastMousePressY[2]) <= maxDistance) {
+    emit mouseClick(e);
+  }
 }
 
 void XpdfWidget::mouseMoveEvent(QMouseEvent *e) {
   int x, y;
 
-  x = (int)(e->x() * scaleFactor);
-  y = (int)(e->y() * scaleFactor);
+  x = (int)(e->pos().x() * scaleFactor);
+  y = (int)(e->pos().y() * scaleFactor);
   core->mouseMove(x, y);
   emit mouseMove(e);
 }

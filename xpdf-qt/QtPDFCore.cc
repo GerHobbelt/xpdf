@@ -90,6 +90,7 @@ QtPDFCore::QtPDFCore(QWidget *viewportA,
 
   // optional features default to on
   hyperlinksEnabled = gTrue;
+  externalHyperlinksEnabled = gTrue;
   selectEnabled = gTrue;
   panEnabled = gTrue;
   showPasswordDialog = gTrue;
@@ -249,7 +250,7 @@ void QtPDFCore::endPan(int wx, int wy) {
   panning = gFalse;
 }
 
-void QtPDFCore::startSelection(int wx, int wy) {
+void QtPDFCore::startSelection(int wx, int wy, GBool extend) {
   int pg, x, y;
 
   takeFocus();
@@ -259,7 +260,11 @@ void QtPDFCore::startSelection(int wx, int wy) {
   if (!cvtWindowToDev(wx, wy, &pg, &x, &y)) {
     return;
   }
-    startSelectionDrag(pg, x, y);
+    if (extend && hasSelection()) {
+      moveSelectionDrag(pg, x, y);
+    } else {
+      startSelectionDrag(pg, x, y);
+    }
     if (getSelectMode() == selectModeBlock) {
       doSetCursor(Qt::CrossCursor);
     }
@@ -368,6 +373,48 @@ void QtPDFCore::mouseMove(int wx, int wy) {
     panMX = wx;
     panMY = wy;
   }
+}
+
+void QtPDFCore::selectWord(int wx, int wy) {
+  int pg, x, y;
+
+  takeFocus();
+  if (!doc || doc->getNumPages() == 0 || !selectEnabled) {
+    return;
+  }
+  if (getSelectMode() != selectModeLinear) {
+    return;
+  }
+  if (!cvtWindowToDev(wx, wy, &pg, &x, &y)) {
+    return;
+  }
+  PDFCore::selectWord(pg, x, y);
+#ifndef NO_TEXT_SELECT
+  if (hasSelection()) {
+    copySelection(gFalse);
+  }
+#endif
+}
+
+void QtPDFCore::selectLine(int wx, int wy) {
+  int pg, x, y;
+
+  takeFocus();
+  if (!doc || doc->getNumPages() == 0 || !selectEnabled) {
+    return;
+  }
+  if (getSelectMode() != selectModeLinear) {
+    return;
+  }
+  if (!cvtWindowToDev(wx, wy, &pg, &x, &y)) {
+    return;
+  }
+  PDFCore::selectLine(pg, x, y);
+#ifndef NO_TEXT_SELECT
+  if (hasSelection()) {
+    copySelection(gFalse);
+  }
+#endif
 }
 
 void QtPDFCore::doLinkCbk(LinkAction *action) {
@@ -515,6 +562,9 @@ GBool QtPDFCore::doAction(LinkAction *action) {
 	namedDest = namedDest->copy();
       }
     } else {
+      if (!externalHyperlinksEnabled) {
+	return gFalse;
+      }
       dest = NULL;
       namedDest = NULL;
       if ((dest = ((LinkGoToR *)action)->getDest())) {
@@ -556,6 +606,9 @@ GBool QtPDFCore::doAction(LinkAction *action) {
 
   // Launch action
   case actionLaunch:
+    if (!externalHyperlinksEnabled) {
+      return gFalse;
+    }
     fileName = ((LinkLaunch *)action)->getFileName();
     s = fileName->getCString();
     if (fileName->getLength() >= 4 &&
@@ -580,7 +633,17 @@ GBool QtPDFCore::doAction(LinkAction *action) {
       if (globalParams->getLaunchCommand()) {
 	cmd->insert(0, ' ');
 	cmd->insert(0, globalParams->getLaunchCommand());
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+	QString cmdStr(cmd->getCString());
+	QStringList tokens = QProcess::splitCommand(cmdStr);
+	if (!tokens.isEmpty()) {
+	  QString program = tokens[0];
+	  tokens.removeFirst();
+	  QProcess::startDetached(program, tokens);
+	}
+#else
 	QProcess::startDetached(cmd->getCString());
+#endif
       } else {
 	msg = new GString("About to execute the command:\n");
 	msg->append(cmd);
@@ -589,7 +652,17 @@ GBool QtPDFCore::doAction(LinkAction *action) {
 				  QMessageBox::Ok | QMessageBox::Cancel,
 				  QMessageBox::Ok)
 	    == QMessageBox::Ok) {
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+	  QString cmdStr(cmd->getCString());
+	  QStringList tokens = QProcess::splitCommand(cmdStr);
+	  if (!tokens.isEmpty()) {
+	    QString program = tokens[0];
+	    tokens.removeFirst();
+	    QProcess::startDetached(program, tokens);
+	  }
+#else
 	  QProcess::startDetached(cmd->getCString());
+#endif
 	}
 	delete msg;
       }
@@ -599,6 +672,9 @@ GBool QtPDFCore::doAction(LinkAction *action) {
 
   // URI action
   case actionURI:
+    if (!externalHyperlinksEnabled) {
+      return gFalse;
+    }
     QDesktopServices::openUrl(QUrl(((LinkURI *)action)->getURI()->getCString(),
 				   QUrl::TolerantMode));
     break;
@@ -631,6 +707,9 @@ GBool QtPDFCore::doAction(LinkAction *action) {
 
   // Movie action
   case actionMovie:
+    if (!externalHyperlinksEnabled) {
+      return gFalse;
+    }
     if (!(cmd = globalParams->getMovieCommand())) {
       error(errConfig, -1, "No movieCommand defined in config file");
       return gFalse;
@@ -773,7 +852,17 @@ void QtPDFCore::runCommand(GString *cmdFmt, GString *arg) {
   } else {
     cmd = cmdFmt->copy();
   }
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+  QString cmdStr(cmd->getCString());
+  QStringList tokens = QProcess::splitCommand(cmdStr);
+  if (!tokens.isEmpty()) {
+    QString program = tokens[0];
+    tokens.removeFirst();
+    QProcess::startDetached(program, tokens);
+  }
+#else
   QProcess::startDetached(cmd->getCString());
+#endif
   delete cmd;
 }
 
@@ -786,7 +875,6 @@ GString *QtPDFCore::mungeURL(GString *url) {
                                "-_.~/?:@&=+,#%";
   GString *newURL;
   char c;
-  char buf[4];
   int i;
 
   newURL = new GString();
@@ -795,8 +883,7 @@ GString *QtPDFCore::mungeURL(GString *url) {
     if (strchr(allowed, c)) {
       newURL->append(c);
     } else {
-      sprintf(buf, "%%%02x", c & 0xff);
-      newURL->append(buf);
+      newURL->appendf("%{0:02x}", c & 0xff);
     }
   }
   return newURL;
